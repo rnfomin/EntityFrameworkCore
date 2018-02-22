@@ -389,6 +389,7 @@ namespace Microsoft.EntityFrameworkCore.Query.Expressions
             }
 
             subquery._tables.AddRange(_tables);
+            subquery._groupBy.AddRange(_groupBy);
 
             foreach (var ordering in _orderBy)
             {
