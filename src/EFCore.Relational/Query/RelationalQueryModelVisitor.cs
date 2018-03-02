@@ -1498,7 +1498,7 @@ namespace Microsoft.EntityFrameworkCore.Query
 
             innerShaper.UpdateQuerySource(fromClause);
 
-            Expression
+            var newExpression
                 = Expression.Call(
                     // ReSharper disable once PossibleNullReferenceException
                     outerShapedQuery.Method
@@ -1507,6 +1507,11 @@ namespace Microsoft.EntityFrameworkCore.Query
                     outerShapedQuery.Arguments[0],
                     outerShapedQuery.Arguments[1],
                     Expression.Constant(compositeShaper));
+
+            Expression = new InjectParametersCompensatingExpressionVisitor(
+                LinqOperatorProvider.SelectMany,
+                QueryCompilationContext.QueryMethodProvider.InjectParametersMethod,
+                newExpression).Visit(Expression);
 
             return true;
         }
@@ -1605,7 +1610,7 @@ namespace Microsoft.EntityFrameworkCore.Query
 
                 innerShaper.UpdateQuerySource(joinClause);
 
-                Expression
+                var newExpression
                     = Expression.Call(
                         // ReSharper disable once PossibleNullReferenceException
                         outerShapedQuery.Method
@@ -1614,9 +1619,59 @@ namespace Microsoft.EntityFrameworkCore.Query
                         outerShapedQuery.Arguments[0],
                         outerShapedQuery.Arguments[1],
                         Expression.Constant(compositeShaper));
+
+                Expression = new InjectParametersCompensatingExpressionVisitor(
+                    LinqOperatorProvider.Join,
+                    QueryCompilationContext.QueryMethodProvider.InjectParametersMethod,
+                    newExpression).Visit(Expression);
             }
 
             return true;
+        }
+
+        private class InjectParametersCompensatingExpressionVisitor : ExpressionVisitorBase
+        {
+            private readonly MethodInfo _methodToReplace;
+            private readonly Expression _targetExpression;
+            private readonly MethodInfo _injectParametersMethod;
+
+            public InjectParametersCompensatingExpressionVisitor(
+                MethodInfo methodToReplace,
+                MethodInfo injectParametersMethod,
+                Expression targetExpression)
+            {
+                _methodToReplace = methodToReplace;
+                _injectParametersMethod = injectParametersMethod;
+                _targetExpression = targetExpression;
+            }
+
+            protected override Expression VisitMethodCall(MethodCallExpression methodCallExpression)
+            {
+                if (methodCallExpression.Method.MethodIsClosedFormOf(_injectParametersMethod))
+                {
+                    var newArguments = new List<Expression>();
+                    foreach (var argument in methodCallExpression.Arguments)
+                    {
+                        newArguments.Add(Visit(argument));
+                    }
+
+                    if (methodCallExpression.Arguments.Zip(newArguments, (l, r) => new { l, r }).Any(e => e.l != e.r))
+                    {
+                        var newMethodInfo = _injectParametersMethod.MakeGenericMethod(newArguments[1].Type.TryGetSequenceType());
+
+                        return Expression.Call(newMethodInfo, newArguments);
+                    }
+
+                    return methodCallExpression;
+                }
+
+                if (methodCallExpression.Method.MethodIsClosedFormOf(_methodToReplace))
+                {
+                    return _targetExpression;
+                }
+
+                return base.VisitMethodCall(methodCallExpression);
+            }
         }
 
         private bool TryFlattenGroupJoin(
@@ -1757,8 +1812,8 @@ namespace Microsoft.EntityFrameworkCore.Query
                     outerShapedQuery.Arguments[0],
                     outerShapedQuery.Arguments[1]);
 
-            Expression =
-                Expression.Call(
+            var newExpression
+                = Expression.Call(
                     groupJoinMethod,
                     Expression.Convert(
                         QueryContextParameter,
@@ -1768,6 +1823,11 @@ namespace Microsoft.EntityFrameworkCore.Query
                     Expression.Constant(innerShaper),
                     groupJoinMethodCallExpression.Arguments[3],
                     groupJoinMethodCallExpression.Arguments[4]);
+
+            Expression = new InjectParametersCompensatingExpressionVisitor(
+                LinqOperatorProvider.GroupJoin,
+                QueryCompilationContext.QueryMethodProvider.InjectParametersMethod,
+                newExpression).Visit(Expression);
 
             return true;
         }
@@ -1831,7 +1891,9 @@ namespace Microsoft.EntityFrameworkCore.Query
             _unflattenedGroupJoinClauses.Remove(groupJoinClause);
             _flattenedAdditionalFromClauses.Add(additionalFromClause);
 
-            var groupJoinMethodCallExpression = (MethodCallExpression)Expression;
+            var groupJoinExtractor = new GroupJoinMethodExtractingVisitor(LinqOperatorProvider.GroupJoin);
+            groupJoinExtractor.Visit(Expression);
+            var groupJoinMethodCallExpression = groupJoinExtractor.Result;
 
             var outerShapedQuery = (MethodCallExpression)groupJoinMethodCallExpression.Arguments[0];
             var innerShapedQuery = (MethodCallExpression)groupJoinMethodCallExpression.Arguments[1];
@@ -1875,7 +1937,7 @@ namespace Microsoft.EntityFrameworkCore.Query
 
             compositeShaper.SaveAccessorExpression(QueryCompilationContext.QuerySourceMapping);
 
-            Expression
+            var newExpression
                 = Expression.Call(
                     outerShapedQuery.Method
                         .GetGenericMethodDefinition()
@@ -1884,7 +1946,36 @@ namespace Microsoft.EntityFrameworkCore.Query
                     outerShapedQuery.Arguments[1],
                     Expression.Constant(compositeShaper));
 
+            Expression = new InjectParametersCompensatingExpressionVisitor(
+                LinqOperatorProvider.GroupJoin,
+                QueryCompilationContext.QueryMethodProvider.InjectParametersMethod,
+                newExpression).Visit(Expression);
+
             return true;
+        }
+
+        private class GroupJoinMethodExtractingVisitor : ExpressionVisitorBase
+        {
+            private readonly MethodInfo _groupJoinMethod;
+
+            public GroupJoinMethodExtractingVisitor(MethodInfo groupJoinMethod)
+            {
+                _groupJoinMethod = groupJoinMethod;
+            }
+
+            public MethodCallExpression Result { get; private set; }
+
+            protected override Expression VisitMethodCall(MethodCallExpression methodCallExpression)
+            {
+                if (methodCallExpression.Method.MethodIsClosedFormOf(_groupJoinMethod))
+                {
+                    Result = methodCallExpression;
+
+                    return methodCallExpression;
+                }
+
+                return base.VisitMethodCall(methodCallExpression);
+            }
         }
 
         #endregion
